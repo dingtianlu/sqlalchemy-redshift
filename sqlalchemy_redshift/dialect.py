@@ -882,7 +882,20 @@ class RedshiftDialectMixin(DefaultDialect):
              JOIN pg_catalog.pg_user u ON u.usesysid = c.relowner
         WHERE c.relkind IN ('r', 'v', 'm', 'S', 'f')
           AND n.nspname !~ '^pg_'
-        ORDER BY c.relkind, n.oid, n.nspname;
+        -- ORDER BY c.relkind, n.oid, n.nspname
+        union
+        SELECT
+          'r' as "relkind",
+          null as "schema_oid",
+          schemaname as "schema",
+          null as "rel_oid",
+          tablename as "relname",
+          null as "diststyle",
+          null as "owner_id",
+          null as "owner_name",
+          null as "view_definition",
+          null as "privileges"
+        FROM svv_external_columns group by schemaname,tablename;
         """))
         relations = {}
         for rel in result:
@@ -953,6 +966,40 @@ class RedshiftDialectMixin(DefaultDialect):
           col_type varchar,
           col_num int)
         WHERE 1 {schema_clause}
+        UNION 
+        SELECT schemaname AS "schema",
+               tablename AS "table_name",
+               columnname AS "name",
+               null AS "encode",
+               -- Spectrum represents data types differently.
+               -- Standardize, so we can infer types.
+               CASE
+                 WHEN external_type = 'int' THEN 'integer'
+                 ELSE
+                   replace(replace(
+                    replace(external_type, 'decimal', 'numeric'),
+                    'varchar', 'character varying(255)'), 'string', 'character varying(255)')
+                 END
+                    AS "type",
+               null AS "distkey",
+               0 AS "sortkey",
+               null AS "notnull",
+               null AS "comment",
+               null AS "adsrc",
+               null AS "attnum",
+               CASE
+                 WHEN external_type = 'int' THEN 'integer'
+                 ELSE
+                   replace(replace(
+                    replace(external_type, 'decimal', 'numeric'),
+                    'varchar', 'character varying(255)'), 'string', 'character varying(255)')
+                 END
+                    AS "format_type",
+               null AS "default",
+               null AS "schema_oid",
+               null AS "table_oid"
+        FROM svv_external_columns
+        WHERE 1 {schema_clause}
         ORDER BY "schema", "table_name", "attnum";
         """.format(schema_clause=schema_clause))
         )
@@ -992,6 +1039,56 @@ class RedshiftDialectMixin(DefaultDialect):
             all_constraints[key].append(con)
         return all_constraints
 
+
+    def has_table(self, connection, table_name, schema=None):
+        # seems like case gets folded in pg_class...
+        from sqlalchemy import util
+        from sqlalchemy.sql import sqltypes
+        if schema is None:
+            cursor = connection.execute(
+                sa.text(
+                    "select relname from pg_class c join pg_namespace n on "
+                    "n.oid=c.relnamespace where "
+                    "pg_catalog.pg_table_is_visible(c.oid) "
+                    "and relname=:name"
+                    " union "
+                    "select distinct tablename as relname "
+                    "from svv_external_columns"
+                    " where tablename=:name"
+                    ""
+                ).bindparams(
+                    sa.bindparam(
+                        "name",
+                        util.text_type(table_name),
+                        type_=sqltypes.Unicode,
+                    )
+                )
+            )
+        else:
+            cursor = connection.execute(
+                sa.text(
+                    "select relname from pg_class c join pg_namespace n on "
+                    "n.oid=c.relnamespace where n.nspname=:schema and "
+                    "relname=:name"
+                    " union "
+                    "select distinct tablename as relname "
+                    "from svv_external_columns"
+                    " where tablename=:name and schemaname=:schema "
+                ).bindparams(
+                    sa.bindparam(
+                        "name",
+                        util.text_type(table_name),
+                        type_=sqltypes.Unicode,
+                    ),
+                    sa.bindparam(
+                        "schema",
+                        util.text_type(schema),
+                        type_=sqltypes.Unicode,
+                    ),
+                )
+            )
+        return bool(cursor.first())
+    
 
 class Psycopg2RedshiftDialectMixin(RedshiftDialectMixin):
     """
